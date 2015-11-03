@@ -1,6 +1,6 @@
-# Copyright (c) 2012 TitanFile Inc. <https://www.titanfile.com>
+# -*- coding: utf-8 -*-
 #
-# Author: Tony Abou-Assaleh <taa@titanfile.com>
+# Copyright: (c) 2011 by the Serge S. Koval, see AUTHORS for more details.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -14,191 +14,423 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from tornadio2 import SocketConnection
-from tornadio2 import event
-from tornadio2.conn import EventMagicMeta
+"""
+    tornadio2.session
+    ~~~~~~~~~~~~~~~~~
 
-from django.conf import settings
-from django.contrib.auth import get_user
+    Active TornadIO2 connection session.
+"""
 
-import sys
+import urlparse
 import logging
 
-# TODO: Use a dummy request from Django instead of declaring a plain one. TAA - 2012-03-09.
-class SessionRequest(object):
+from tornado.web import HTTPError
+
+from tornadio2 import sessioncontainer, proto, periodic, stats
+
+
+class ConnectionInfo(object):
+    """Connection information object.
+
+    Will be passed to the ``on_open`` handler of your connection class.
+
+    Has few properties:
+
+    `ip`
+        Caller IP address
+    `cookies`
+        Collection of cookies
+    `arguments`
+        Collection of the query string arguments
     """
-    An object that stores a reference to a Django session.
+    def __init__(self, ip, host, arguments, cookies):
+        self.ip = ip
+        self.host = host
+        self.cookies = cookies
+        self.arguments = arguments
+
+    def get_argument(self, name):
+        """Return single argument by name"""
+        val = self.arguments.get(name)
+        if val:
+            return val[0]
+        return None
+
+    def get_cookie(self, name):
+        """Return single cookie by its name"""
+        return self.cookies.get(name)
+
+
+class Session(sessioncontainer.SessionBase):
+    """Socket.IO session implementation.
+
+    Session has some publicly accessible properties:
+
+    `server`
+        Server association. Server contains io_loop instance, settings, etc.
+    `remote_ip`
+        Remote IP
+    `is_closed`
+        Check if session is closed or not.
     """
-    def __init__(self, session_key):
-        """
-        Initialize the instance with a reference to a Django session.
+    def __init__(self, conn, server, request, expiry=None):
+        """Session constructor.
 
-        `session_key`
-            The key of the session to be retrived.
+        `conn`
+            Default connection class
+        `server`
+            Associated server
+        `handler`
+            Request handler that created new session
+        `expiry`
+            Session expiry
         """
-        from django.utils.importlib import import_module
-        engine = import_module(settings.SESSION_ENGINE)
-        self.session = engine.SessionStore(session_key)
+        # Initialize session
+        super(Session, self).__init__(None, expiry)
 
-class SocketEventHandler(SocketConnection):
-    def get_user_instance(self, Model, **kwargs):
+        self.server = server
+        self.send_queue = []
+        self.handler = None
+
+        # Stats
+        server.stats.session_opened()
+
+        self.remote_ip = request.remote_ip
+
+        # Create connection instance
+        self.conn = conn(self)
+
+        # Call on_open.
+        self.info = ConnectionInfo(request.remote_ip,
+                              request.host,
+                              request.arguments,
+                              request.cookies)
+
+        # If everything is fine - continue
+        self.send_message(proto.connect())
+
+        # Heartbeat related stuff
+        self._heartbeat_timer = None
+        self._heartbeat_interval = self.server.settings['heartbeat_interval'] * 1000
+        self._missed_heartbeats = 0
+
+        # Endpoints
+        self.endpoints = dict()
+
+        result = self.conn.on_open(self.info)
+        if result is not None and not result:
+            raise HTTPError(401)
+
+    # Session callbacks
+    def on_delete(self, forced):
+        """Session expiration callback
+
+        `forced`
+            If session item explicitly deleted, forced will be set to True. If
+            item expired, will be set to False.
         """
-        Get an instance belonging to the current user that matches the `id` in `kwargs`.
-
-        This method ensures that only instances owned by the current user are accessed.
-        """
-        try:
-            instance = Model.active.get(user=self.user, slug=kwargs['id'])
-        except Model.DoesNotExist:
-            return 'Contact does not exist', None
-        except:
-            print 'Exception in get_user_instance: kwargs = %s' % repr(kwargs)
-            raise
-        return instance
-
-    def get_instance(self, Model, **kwargs):
-        try:
-            instance = Model.active.get(slug=kwargs['id'])
-        except Model.DoesNotExist:
-            return 'Contact does not exist', None
-        except:
-            print 'Exception in get_instance: kwargs = %s' % repr(kwargs)
-            raise
-        return instance
-         
-    def handle_read(self, read_model, read_collection, **kwargs):
-        '''A read event can be triggered on a collection or individual models.'''
-        if 'args' in kwargs and isinstance(kwargs['args'], list):
-            return read_collection(**kwargs)
+        # Do not remove connection if it was not forced and there's running connection
+        if not forced and self.handler is not None and not self.is_closed:
+            self.promote()
         else:
-            return read_model(**kwargs)
-
-class BackboneConnection(SocketConnection):
-    """
-    A SocketConnection wrapper for Django.
-    """
-
-    def on_event(self, name, *args, **kwargs):
-        """Override TorndaIO2's default on_event handler.
-
-        By default, it uses decorator-based approach to handle events,
-        but you can override it to implement custom event handling.
-
-        `name`
-            Event name
-        `args`
-            Event args
-        `kwargs`
-            Event kwargs
-
-        There's small magic around event handling.
-        If you send exactly one parameter from the client side and it is dict,
-        then you will receive parameters in dict in `kwargs`. In all other
-        cases you will have `args` list.
-
-        For example, if you emit event like this on client-side::
-
-            sock.emit('test', {msg='Hello World'})
-
-        you will have following parameter values in your on_event callback::
-
-            name = 'test'
-            args = []
-            kwargs = {msg: 'Hello World'}
-
-        However, if you emit event like this::
-
-            sock.emit('test', 'a', 'b', {msg='Hello World'})
-
-        you will have following parameter values::
-
-            name = 'test'
-            args = ['a', 'b', {msg: 'Hello World'}]
-            kwargs = {}
-
-        """
-        # Ensure that the user is still authenticated for each event.
-        try:
-            self.user = get_user(self.session_request)
-            if self.user.is_authenticated():
-                print 'User is authenticated. Proceeding with the event handling.'
-        except:
-            print "Unexpected error:", sys.exc_info()
             self.close()
+
+    # Add session
+    def set_handler(self, handler):
+        """Set active handler for the session
+
+        `handler`
+            Associate active Tornado handler with the session
+        """
+        # Check if session already has associated handler
+        if self.handler is not None:
             return False
-        name = name.replace(':', '_')  # turn iosync event such as user:read to user_read
 
-        # Process collection IDs:
-        id_sep = getattr(settings, 'SOCKETIO_ID_SEPARATOR', '-')
-        if id_sep in name:
-            name, collection_id = name.split(id_sep, 2)
-            kwargs['collection_id'] = collection_id
+        # If IP address don't match - refuse connection
+        if self.server.settings['verify_remote_ip'] and handler.request.remote_ip != self.remote_ip:
+            logging.error('Attempted to attach to session %s (%s) from different IP (%s)' % (
+                          self.session_id,
+                          self.remote_ip,
+                          handler.request.remote_ip
+                          ))
+            return False
 
-        handler = self._events.get(name)
+        # Associate handler and promote
+        self.handler = handler
+        self.promote()
 
-        if handler:
-            try:
-                # Backbone.iosync always sends data in kwargs, either in 'kwargs' or 'args' keys.
-                if 'args' in kwargs:
-                    # Collection read events send data in kwargs['args']
-                    args = kwargs['args']
-                if 'kwargs' in kwargs:
-                    # Model read events send data in kwargs['kwargs']
-                    kwargs = kwargs['kwargs']
-                return handler(self, *args, **kwargs)
-            except TypeError:
-                logging.error(('Attempted to call event handler %s ' +
-                                  'with %s args and %s kwargs.') % (handler, repr(args), repr(kwargs)))
-                raise
-        else:
-            message = 'Invalid event name: %s' % name
-            logging.error(message)
-            return message
+        # Stats
+        self.server.stats.connection_opened()
 
-    def broadcast(self, event, message, include_self=False):
-        session_items = self.session.server._sessions._items
-        for session_id, session in session_items.iteritems():
-            if include_self or session != self.session:
-                session.conn.emit(event, message)
+        return True
 
-    @staticmethod
-    def broadcast_user(user, event, message, exclude=None):
-        if 'connections' not in settings.SOCKETIO_GLOBALS:
+    def remove_handler(self, handler):
+        """Remove active handler from the session
+
+        `handler`
+            Handler to remove
+        """
+        # Attempt to remove another handler
+        if self.handler != handler:
+            raise Exception('Attempted to remove invalid handler')
+
+        self.handler = None
+        self.promote()
+
+        self.server.stats.connection_closed()
+
+    def send_message(self, pack):
+        """Send socket.io encoded message
+
+        `pack`
+            Encoded socket.io message
+        """
+        logging.debug('<<< ' + pack)
+
+        # TODO: Possible optimization if there's on-going connection - there's no
+        # need to queue messages?
+
+        self.send_queue.append(pack)
+        self.flush()
+
+    def flush(self):
+        """Flush message queue if there's an active connection running"""
+        if self.handler is None:
             return
-        for conn in settings.SOCKETIO_GLOBALS['connections'][user.id]:
-            if not exclude or conn not in exclude:
-                conn.emit(event, message)
 
-    def on_open(self, conn_info):
-        session_key = conn_info.get_cookie('sessionid').value
-        request = SessionRequest(session_key)
-        self.session_request = request  # Store the request for future access to the session.
-        user = get_user(request)
-        if not user.is_authenticated():
-            return False
-        self.user = user
-        settings.SOCKETIO_GLOBALS['connections'][user.id].add(self)
+        if not self.send_queue:
+            return
 
-    def on_close(self):
-        settings.SOCKETIO_GLOBALS['connections'][self.user.id].remove(self)
+        self.handler.send_messages(self.send_queue)
 
-    @event
-    def command(self, *args, **kwargs):
+        self.send_queue = []
+
+        # If session was closed, detach connection
+        if self.is_closed and self.handler is not None:
+            self.handler.session_closed()
+
+    # Close connection with all endpoints or just one endpoint
+    def close(self, endpoint=None):
+        """Close session or endpoint connection.
+
+        `endpoint`
+            If endpoint is passed, will close open endpoint connection. Otherwise
+            will close whole socket.
         """
-        Shell-like API. Restricted access to superusers.
-        """
-        if not self.user.is_superuser:
-            return 'Permission denied.', None
-        command = kwargs['command']
-        name = kwargs['event']
-        del kwargs['command']
-        del kwargs['event']
-        # TODO: Incomplete. TAA - 2012-03-16.
-        if name == 'emit':
-            self.emit()
-        super(BackboneConnection, self).on_event(name, *args, **kwargs)
+        if endpoint is None:
+            if not self.conn.is_closed:
+                # Close child connections
+                for k in self.endpoints.keys():
+                    self.disconnect_endpoint(k)
 
-class BaseSocket(BackboneConnection):
-    '''A base socket class to be mixed in with other sockets.'''
-    def on_message(self, message):
-        print 'Received message: %s' % str(message)
+                # Close parent connections
+                try:
+                    self.conn.on_close()
+                finally:
+                    self.conn.is_closed = True
+
+                    # Stats
+                    self.server.stats.session_closed()
+
+                # Stop heartbeats
+                self.stop_heartbeat()
+
+                # Send disconnection message
+                self.send_message(proto.disconnect())
+
+                # Notify transport that session was closed
+                if self.handler is not None:
+                    self.handler.session_closed()
+        else:
+            # Disconnect endpoint
+            self.disconnect_endpoint(endpoint)
+
+    @property
+    def is_closed(self):
+        """Check if session was closed"""
+        return self.conn.is_closed
+
+    # Heartbeats
+    def reset_heartbeat(self):
+        """Reset hearbeat timer"""
+        self.stop_heartbeat()
+
+        self._heartbeat_timer = periodic.Callback(self._heartbeat,
+                                                  self._heartbeat_interval,
+                                                  self.server.io_loop)
+        self._heartbeat_timer.start()
+
+    def stop_heartbeat(self):
+        """Stop active heartbeat"""
+        if self._heartbeat_timer is not None:
+            self._heartbeat_timer.stop()
+            self._heartbeat_timer = None
+
+    def delay_heartbeat(self):
+        """Delay active heartbeat"""
+        if self._heartbeat_timer is not None:
+            self._heartbeat_timer.delay()
+
+    def _heartbeat(self):
+        """Heartbeat callback"""
+        self.send_message(proto.heartbeat())
+
+        self._missed_heartbeats += 1
+
+        # TODO: Configurable
+        if self._missed_heartbeats > 2:
+            self.close()
+
+    # Endpoints
+    def connect_endpoint(self, url):
+        """Connect endpoint from URL.
+
+        `url`
+            socket.io endpoint URL.
+        """
+        urldata = urlparse.urlparse(url)
+
+        endpoint = urldata.path
+
+        conn = self.endpoints.get(endpoint, None)
+        if conn is None:
+            conn_class = self.conn.get_endpoint(endpoint)
+            if conn_class is None:
+                logging.error('There is no handler for endpoint %s' % endpoint)
+                return
+
+            conn = conn_class(self, endpoint)
+            self.endpoints[endpoint] = conn
+
+        self.send_message(proto.connect(endpoint))
+
+        if conn.on_open(self.info) == False:
+            self.disconnect_endpoint(endpoint)
+
+    def disconnect_endpoint(self, endpoint):
+        """Disconnect endpoint
+
+        `endpoint`
+            endpoint name
+        """
+        if endpoint not in self.endpoints:
+            logging.error('Invalid endpoint for disconnect %s' % endpoint)
+            return
+
+        conn = self.endpoints[endpoint]
+
+        del self.endpoints[endpoint]
+
+        conn.on_close()
+        self.send_message(proto.disconnect(endpoint))
+
+    def get_connection(self, endpoint):
+        """Get connection object.
+
+        `endpoint`
+            Endpoint name. If set to None, will return default connection object.
+        """
+        if endpoint:
+            return self.endpoints.get(endpoint)
+        else:
+            return self.conn
+
+    # Message handler
+    def raw_message(self, msg):
+        """Socket.IO message handler.
+
+        `msg`
+            Raw socket.io message to handle
+        """
+        try:
+            logging.debug('>>> ' + msg)
+
+            parts = msg.split(':', 3)
+            if len(parts) == 3:
+                msg_type, msg_id, msg_endpoint = parts
+                msg_data = None
+            else:
+                msg_type, msg_id, msg_endpoint, msg_data = parts
+
+            # Packets that don't require valid endpoint
+            if msg_type == proto.DISCONNECT:
+                if not msg_endpoint:
+                    self.close()
+                else:
+                    self.disconnect_endpoint(msg_endpoint)
+                return
+            elif msg_type == proto.CONNECT:
+                if msg_endpoint:
+                    self.connect_endpoint(msg_endpoint)
+                else:
+                    # TODO: Disconnect?
+                    logging.error('Invalid connect without endpoint')
+                return
+
+            # All other packets need endpoints
+            conn = self.get_connection(msg_endpoint)
+            if conn is None:
+                logging.error('Invalid endpoint: %s' % msg_endpoint)
+                return
+
+            if msg_type == proto.HEARTBEAT:
+                self._missed_heartbeats = 0
+            elif msg_type == proto.MESSAGE:
+                # Handle text message
+                conn.on_message(msg_data)
+
+                if msg_id:
+                    self.send_message(proto.ack(msg_endpoint, msg_id))
+            elif msg_type == proto.JSON:
+                # Handle json message
+                conn.on_message(proto.json_load(msg_data))
+
+                if msg_id:
+                    self.send_message(proto.ack(msg_endpoint, msg_id))
+            elif msg_type == proto.EVENT:
+                # Javascript event
+                event = proto.json_load(msg_data)
+
+                # TODO: Verify if args = event.get('args', []) won't be slower.
+                args = event.get('args')
+                if args is None:
+                    args = []
+
+                ack_response = None
+
+                # It is kind of magic - if there's only one parameter
+                # and it is dict, unpack dictionary. Otherwise, pass
+                # in args
+                if len(args) == 1 and isinstance(args[0], dict):
+                    # Fix for the http://bugs.python.org/issue4978 for older Python versions
+                    str_args = dict((str(x), y) for x, y in args[0].iteritems())
+
+                    ack_response = conn.on_event(event['name'], msg_id=msg_id, kwargs=str_args)
+                else:
+                    ack_response = conn.on_event(event['name'], msg_id=msg_id, args=args)
+
+                if ack_response is not None and msg_id:
+                    if msg_id.endswith('+'):
+                        msg_id = msg_id[:-1]
+
+                    self.send_message(proto.ack(msg_endpoint, msg_id, ack_response))
+            elif msg_type == proto.ACK:
+                # Handle ACK
+                ack_data = msg_data.split('+', 2)
+
+                data = None
+                if len(ack_data) > 1:
+                    data = proto.json_load(ack_data[1])
+
+                conn.deque_ack(int(ack_data[0]), data)
+            elif msg_type == proto.ERROR:
+                # TODO: Pass it to handler?
+                logging.error('Incoming error: %s' % msg_data)
+            elif msg_type == proto.NOOP:
+                pass
+        except Exception, ex:
+            logging.exception(ex)
+
+            # TODO: Add global exception callback?
+
+            raise
